@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Instant AirDrop</title>
+    <script src="https://scaledrone.com"></script>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #f0f2f5; margin: 0; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 100%; box-sizing: border-box; }
+        .btn { background: #007aff; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer; margin-top: 15px; width: 100%; transition: background 0.2s; }
+        .btn:hover { background: #0056b3; }
+        .btn-copy { background: #34c759; margin-top: 10px; }
+        .btn-copy:hover { background: #28a745; }
+        #share-url { font-weight: bold; word-break: break-all; margin: 15px 0; color: #007aff; padding: 10px; background: #f8f9fa; border-radius: 6px; border: 1px dashed #007aff; font-size: 14px; }
+        .hidden { display: none; }
+        #progress { width: 100%; background: #ddd; border-radius: 5px; margin-top: 15px; }
+        #progress-bar { width: 0%; height: 20px; background: #34c759; border-radius: 5px; text-align: center; color: white; line-height: 20px; font-size: 12px; transition: width 0.1s linear; }
+        input[type="file"] { margin: 20px 0; width: 100%; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>P2P Instant Share</h2>
+    
+    <!-- Step 1: Sender side -->
+    <div id="sender-ui">
+        <p>1. Select a file to share:</p>
+        <input type="file" id="file-input"><br>
+        
+        <div id="link-section" class="hidden">
+            <p>2. Send this link to the receiver:</p>
+            <div id="share-url">Generating link...</div>
+            <button class="btn btn-copy" id="copy-btn">📋 Copy Share Link</button>
+        </div>
+    </div>
+
+    <!-- Step 2: Receiver side -->
+    <div id="receiver-ui" class="hidden">
+        <p>Connected to sender. Waiting for file stream...</p>
+        <h3 id="file-details"></h3>
+        <a id="download-btn" class="hidden"><button class="btn">💾 Save File</button></a>
+    </div>
+
+    <!-- Progress Tracker -->
+    <div id="progress" class="hidden">
+        <div id="progress-bar">0%</div>
+    </div>
+    <p id="status">Connecting to signaling service...</p>
+</div>
+
+<script>
+    // --- Configuration ---
+    // Using ScaleDrone demo channel
+    const CHANNEL_ID = 'askimS7q95Z4v8v7'; 
+    
+    // Generate or fetch unique room hash
+    let roomHash = window.location.hash;
+    if (!roomHash) {
+        roomHash = '#' + Math.random().toString(36).substring(2, 9);
+        window.location.hash = roomHash;
+    }
+    const roomName = 'observable-' + roomHash.replace('#', '');
+
+    // Check if the current URL points to a receiver session
+    const isReceiver = window.location.search.includes('role=receiver');
+
+    // Build the shareable URL robustly (works on file:// and http://)
+    let shareLink = window.location.href;
+    if (!isReceiver) {
+        if (window.location.search) {
+            shareLink = window.location.href.replace(window.location.search, '?role=receiver');
+        } else {
+            shareLink = window.location.href.replace(window.location.hash, '') + '?role=receiver' + roomHash;
+        }
+    }
+
+    // UI Elements
+    const statusText = document.getElementById('status');
+    const progressDiv = document.getElementById('progress');
+    const progressBar = document.getElementById('progress-bar');
+    const copyBtn = document.getElementById('copy-btn');
+    const shareUrlDiv = document.getElementById('share-url');
+
+    // WebRTC Setup
+    const configuration = { iceServers: [{ urls: 'stun:://google.com' }] };
+    let pc, dataChannel;
+
+    // Connect to ScaleDrone Signaling Server
+    const drone = new ScaleDrone(CHANNEL_ID);
+    drone.on('open', error => {
+        if (error) {
+            statusText.innerText = "Connection error. Try reloading.";
+            return console.error(error);
+        }
+        statusText.innerText = isReceiver ? "Waiting for sender..." : "Ready. Choose a file.";
+        
+        const room = drone.subscribe(roomName);
+        room.on('data', (message, client) => {
+            if (client.id === drone.clientId) return; // Ignore own messages
+            handleSignalingMessage(message);
+        });
+    });
+
+    function sendMessage(message) {
+        drone.publish({ room: roomName, message });
+    }
+
+    // --- Sender Logic ---
+    if (!isReceiver) {
+        document.getElementById('link-section').classList.remove('hidden');
+        shareUrlDiv.innerText = shareLink;
+
+        // Copy functionality
+        copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(shareLink).then(() => {
+                copyBtn.innerText = "✅ Link Copied!";
+                setTimeout(() => { copyBtn.innerText = "📋 Copy Share Link"; }, 2000);
+            }).catch(err => {
+                alert("Could not copy automatically. Please copy the text inside the box manually.");
+            });
+        });
+
+        const fileInput = document.getElementById('file-input');
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length === 0) return;
+            statusText.innerText = "Connecting to peer...";
+            initWebRTC(true);
+        });
+    }
+
+    // --- Receiver Logic ---
+    if (isReceiver) {
+        document.getElementById('sender-ui').classList.add('hidden');
+        document.getElementById('receiver-ui').classList.remove('hidden');
+        initWebRTC(false);
+    }
+
+    // --- WebRTC Protocol Engine ---
+    function initWebRTC(isInitiator) {
+        pc = new RTCPeerConnection(configuration);
+
+        pc.onicecandidate = event => {
+            if (event.candidate) sendMessage({ candidate: event.candidate });
+        };
+
+        if (isInitiator) {
+            dataChannel = pc.createDataChannel('fileTransfer');
+            setupSenderChannel(dataChannel);
+
+            pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => {
+                sendMessage({ sdp: pc.localDescription });
+            });
+        } else {
+            pc.ondatachannel = event => {
+                dataChannel = event.channel;
+                setupReceiverChannel(dataChannel);
+            };
+        }
+    }
+
+    function handleSignalingMessage(message) {
+        if (message.sdp) {
+            pc.setRemoteDescription(new RTCSessionDescription(message.sdp)).then(() => {
+                if (pc.remoteDescription.type === 'offer') {
+                    pc.createAnswer().then(answer => pc.setLocalDescription(answer)).then(() => {
+                        sendMessage({ sdp: pc.localDescription });
+                    });
+                }
+            });
+        } else if (message.candidate) {
+            pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+        }
+    }
+
+    // --- Data Transmission handlers ---
+    function setupSenderChannel(channel) {
+        channel.onopen = () => {
+            statusText.innerText = "Connected! Sending stream...";
+            progressDiv.classList.remove('hidden');
+            
+            const file = document.getElementById('file-input').files[0];
+            channel.send(JSON.stringify({ name: file.name, size: file.size }));
+
+            const chunkSize = 16384; 
+            const fileReader = new FileReader();
+            let offset = 0;
+
+            fileReader.addEventListener('load', e => {
+                channel.send(e.target.result);
+                offset += e.target.result.byteLength;
+                
+                const percent = Math.round((offset / file.size) * 100);
+                progressBar.style.width = percent + '%';
+                progressBar.innerText = percent + '%';
+
+                if (offset < file.size) {
+                    if (channel.bufferedAmount > 16000000) { 
+                        setTimeout(readNextChunk, 100);
+                    } else {
+                        readNextChunk();
+                    }
+                } else {
+                    statusText.innerText = "Success! File sent.";
+                }
+            });
+
+            function readNextChunk() {
+                const slice = file.slice(offset, offset + chunkSize);
+                fileReader.readAsArrayBuffer(slice);
+            }
+            readNextChunk();
+        };
+    }
+
+    function setupReceiverChannel(channel) {
+        let fileInfo = null;
+        let receivedBuffers = [];
+        let receivedSize = 0;
+
+        channel.onmessage = event => {
+            progressDiv.classList.remove('hidden');
+            
+            if (typeof event.data === 'string') {
+                fileInfo = JSON.parse(event.data);
+                document.getElementById('file-details').innerText = `Incoming file: ${fileInfo.name}`;
+                return;
+            }
+
+            receivedBuffers.push(event.data);
+            receivedSize += event.data.byteLength;
+
+            const percent = Math.round((receivedSize / fileInfo.size) * 100);
+            progressBar.style.width = percent + '%';
+            progressBar.innerText = percent + '%';
+
+            if (receivedSize === fileInfo.size) {
+                statusText.innerText = "Download Ready!";
+                const blob = new Blob(receivedBuffers);
+                const downloadBtn = document.getElementById('download-btn');
+                downloadBtn.href = URL.createObjectURL(blob);
+                downloadBtn.download = fileInfo.name;
+                downloadBtn.classList.remove('hidden');
+            }
+        };
+    }
+</script>
+</body>
+</html>
