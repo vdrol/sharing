@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instant P2P File Share</title>
+    <!-- Importing PeerJS for easy WebRTC signaling -->
+    <script src="https://unpkg.com"></script>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #f4f7f6;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            text-align: center;
+            max-width: 450px;
+            width: 100%;
+        }
+        h1 { color: #333; margin-bottom: 1.5rem; }
+        .section { margin: 1.5rem 0; padding: 1rem; border: 1px dashed #ccc; border-radius: 8px; }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover { background-color: #0056b3; }
+        input[type="file"] { margin-bottom: 10px; }
+        #status { color: #666; font-style: italic; margin-top: 1rem; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>⚡ Instant P2P Share</h1>
+    <p id="my-id-display">Initializing connection...</p>
+
+    <!-- Sender Section -->
+    <div id="sender-section" class="section">
+        <h3>Option 1: Send a File</h3>
+        <input type="file" id="file-input"><br><br>
+        <p>Share your ID with the receiver, or send them this direct link:</p>
+        <button id="copy-link-btn" disabled>Copy Share Link</button>
+    </div>
+
+    <!-- Receiver Section -->
+    <div id="receiver-section" class="section">
+        <h3>Option 2: Receive a File</h3>
+        <input type="text" id="peer-id-input" placeholder="Enter Sender's ID">
+        <button id="connect-btn">Connect & Download</button>
+    </div>
+
+    <div id="status">Ready to connect.</div>
+</div>
+
+<script>
+    // Initialize PeerJS (uses public cloud signaling server for handshake)
+    const peer = new Peer();
+    let conn = null;
+
+    const myIdDisplay = document.getElementById('my-id-display');
+    const fileInput = document.getElementById('file-input');
+    const copyLinkBtn = document.getElementById('copy-link-btn');
+    const peerIdInput = document.getElementById('peer-id-input');
+    const connectBtn = document.getElementById('connect-btn');
+    const statusDiv = document.getElementById('status');
+
+    // 1. When PeerJS connects to signaling server and gets an ID
+    peer.on('open', (id) => {
+        myIdDisplay.innerHTML = `Your Connection ID: <strong>${id}</strong>`;
+        copyLinkBtn.disabled = false;
+        
+        // Auto-fill and connect if ID is in the URL parameters (for easy sharing)
+        const urlParams = new URLSearchParams(window.location.search);
+        const connectTo = urlParams.get('room');
+        if (connectTo) {
+            peerIdInput.value = connectTo;
+            initiateConnection(connectTo);
+        }
+    });
+
+    // Copy link helper
+    copyLinkBtn.addEventListener('click', () => {
+        const shareUrl = `${window.location.origin}${window.location.pathname}?room=${peer.id}`;
+        navigator.clipboard.writeText(shareUrl);
+        statusDiv.innerText = "Share link copied to clipboard!";
+    });
+
+    // 2. SENDER: Wait for receiver to connect
+    peer.on('connection', (connection) => {
+        conn = connection;
+        statusDiv.innerText = "Receiver connected! Preparing file transfer...";
+        setupFileTransfer();
+    });
+
+    // 3. RECEIVER: Manually connect via button
+    connectBtn.addEventListener('click', () => {
+        const targetId = peerIdInput.value.trim();
+        if (targetId) initiateConnection(targetId);
+    });
+
+    function initiateConnection(targetId) {
+        statusDiv.innerText = "Connecting to sender...";
+        conn = peer.connect(targetId);
+        
+        conn.on('open', () => {
+            statusDiv.innerText = "Connected! Waiting for file data...";
+        });
+
+        // Listen for incoming file data chunks
+        let receivedChunks = [];
+        let fileInfo = null;
+
+        conn.on('data', (data) => {
+            if (data.type === 'meta') {
+                fileInfo = data;
+                receivedChunks = [];
+                statusDiv.innerText = `Receiving: ${data.name} (${(data.size / 1024 / 1024).toFixed(2)} MB)...`;
+            } else if (data.type === 'chunk') {
+                receivedChunks.push(data.bits);
+                if (receivedChunks.length === data.totalChunks) {
+                    // Reassemble file once all chunks arrive
+                    const blob = new Blob(receivedChunks);
+                    const url = URL.createObjectURL(blob);
+                    
+                    // Trigger instant download
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = fileInfo.name;
+                    a.click();
+                    
+                    statusDiv.innerText = "File downloaded successfully!";
+                    URL.revokeObjectURL(url);
+                }
+            }
+        });
+    }
+
+    // 4. FILE TRANSMISSION LOGIC (Sender side)
+    function setupFileTransfer() {
+        fileInput.addEventListener('change', () => {
+            const file = fileInput.files[0];
+            if (!file || !conn) return;
+
+            statusDiv.innerText = `Sending metadata for ${file.name}...`;
+
+            // Split the file into small chunks (WebRTC DataChannel handles ~16KB chunks safely)
+            const chunkSize = 16384; 
+            const totalChunks = Math.ceil(file.size / chunkSize);
+
+            // Send metadata first
+            conn.send({
+                type: 'meta',
+                name: file.name,
+                size: file.size,
+                totalChunks: totalChunks
+            });
+
+            let currentChunk = 0;
+            const reader = new FileReader();
+
+            reader.onload = function(e) {
+                conn.send({
+                    type: 'chunk',
+                    bits: e.target.result,
+                    currentChunk: currentChunk,
+                    totalChunks: totalChunks
+                });
+                currentChunk++;
+                if (currentChunk < totalChunks) {
+                    loadNext();
+                } else {
+                    statusDiv.innerText = "File sent completely!";
+                }
+            };
+
+            function loadNext() {
+                statusDiv.innerText = `Sending file: ${Math.round((currentChunk / totalChunks) * 100)}%`;
+                const start = currentChunk * chunkSize;
+                const end = Math.min(start + chunkSize, file.size);
+                reader.readAsArrayBuffer(file.slice(start, end));
+            }
+
+            loadNext();
+        });
+    }
+</script>
+</body>
+</html>
